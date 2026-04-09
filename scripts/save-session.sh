@@ -30,12 +30,22 @@ for ((i=0; i<tab_count; i++)); do
 
     title=$(qdbus org.kde.yakuake /yakuake/tabs tabTitle "$sid" 2>/dev/null || echo "")
 
-    # Konsole session path is terminal_id + 1
+    # Get the working directory. If the terminal is running tmux, query tmux
+    # for the pane's cwd (since /proc/<tmux-client-pid>/cwd is just where
+    # tmux was launched from, not the shell's actual directory).
     konsole_sid=$((sid + 1))
-    pid=$(qdbus org.kde.yakuake /Sessions/$konsole_sid processId 2>/dev/null || echo "")
     cwd="$HOME"
-    if [[ -n "$pid" ]] && [[ -d "/proc/$pid/cwd" ]]; then
-        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "$HOME")
+
+    # First try tmux: check if this tab has a tmux session named yakuake-$i
+    tmux_cwd=$(tmux display-message -t "yakuake-${i}" -p '#{pane_current_path}' 2>/dev/null || echo "")
+    if [[ -n "$tmux_cwd" ]]; then
+        cwd="$tmux_cwd"
+    else
+        # Fallback: read from /proc for non-tmux terminals
+        pid=$(qdbus org.kde.yakuake /Sessions/$konsole_sid processId 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && [[ -d "/proc/$pid/cwd" ]]; then
+            cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "$HOME")
+        fi
     fi
 
     # Get terminal IDs for this session (for split pane support later)

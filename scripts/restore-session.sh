@@ -53,6 +53,20 @@ if tmux list-sessions &>/dev/null 2>&1; then
     echo "tmux server is running, will reattach to existing sessions"
 else
     echo "tmux server is not running, starting and restoring sessions..."
+
+    # Fix broken resurrect 'last' symlink before attempting restore.
+    # The symlink can break if a save is interrupted (e.g., by sudden shutdown).
+    RESURRECT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+    RESURRECT_LAST="$RESURRECT_DIR/last"
+    if [[ -L "$RESURRECT_LAST" ]] && [[ ! -e "$RESURRECT_LAST" ]]; then
+        echo "Fixing broken resurrect 'last' symlink..."
+        latest=$(ls -1t "$RESURRECT_DIR"/tmux_resurrect_*.txt 2>/dev/null | head -1)
+        if [[ -n "$latest" ]]; then
+            ln -sf "$(basename "$latest")" "$RESURRECT_LAST"
+            echo "Pointed 'last' to $(basename "$latest")"
+        fi
+    fi
+
     # Start a temporary tmux session to bootstrap the server.
     # This loads ~/.tmux.conf (which sources our tmux.conf), initializing TPM
     # and setting resurrect options.
@@ -63,7 +77,7 @@ else
 
     # Explicitly run tmux-resurrect restore
     if [[ -x "$RESURRECT_RESTORE" ]]; then
-        tmux run-shell "$RESURRECT_RESTORE" 2>/dev/null || echo "Warning: resurrect restore failed" >&2
+        tmux run-shell "$RESURRECT_RESTORE" 2>&1 || echo "Warning: resurrect restore failed" >&2
         # Give resurrect time to recreate sessions
         sleep 2
     else
