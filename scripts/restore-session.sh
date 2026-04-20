@@ -92,24 +92,57 @@ fi
 mkdir -p "$INSTRUCTION_DIR"
 chmod 700 "$INSTRUCTION_DIR"
 
+# Helper: list Konsole session IDs (numbers from /Sessions/N)
+list_konsole_sids() {
+    qdbus org.kde.yakuake 2>/dev/null | grep -E '^/Sessions/[0-9]+$' | sed 's|/Sessions/||' | sort -n
+}
+
+# Helper: find a new Konsole session ID (not in $1) by polling for up to 5s
+find_new_konsole_sid() {
+    local before="$1"
+    for _ in $(seq 1 50); do
+        local current
+        current=$(list_konsole_sids)
+        for sid in $current; do
+            if ! echo "$before" | grep -qE "^$sid$"; then
+                echo "$sid"
+                return 0
+            fi
+        done
+        sleep 0.1
+    done
+    return 1
+}
+
 default_session=$(qdbus org.kde.yakuake /yakuake/sessions sessionIdList | cut -d, -f1)
+
+# Snapshot initial Konsole sessions — for the default tab (tab 0), the
+# only existing Konsole session belongs to it.
+initial_konsole_sids=$(list_konsole_sids)
+default_konsole_sid=$(echo "$initial_konsole_sids" | head -1)
 
 for ((i = 0; i < tab_count; i++)); do
     title=$(jq -r ".tabs[$i].title" "$STATE_FILE")
     cwd=$(jq -r ".tabs[$i].cwd" "$STATE_FILE")
 
-    # First tab: reuse the existing default session. Otherwise: add a new one.
+    # First tab: reuse the existing default session. Otherwise: add a new one
+    # and detect which Konsole session path was created for it.
     if [[ $i -eq 0 ]]; then
         session_id="$default_session"
+        konsole_sid="$default_konsole_sid"
     else
+        before_sids=$(list_konsole_sids)
         session_id=$(qdbus org.kde.yakuake /yakuake/sessions addSession)
+        konsole_sid=$(find_new_konsole_sid "$before_sids" || true)
+        if [[ -z "$konsole_sid" ]]; then
+            echo "Warning: could not detect Konsole session for tab $i (yakuake sid=$session_id)" >&2
+            # Fall back to the old +1 assumption
+            konsole_sid=$((session_id + 1))
+        fi
     fi
 
     # Set tab title
     qdbus org.kde.yakuake /yakuake/tabs org.kde.yakuake.setTabTitle "$session_id" "$title" 2>/dev/null
-
-    # Compute the Konsole session ID (yakuake session ID + 1)
-    konsole_sid=$((session_id + 1))
 
     # Write instruction file for tmux-auto-session.sh.
     # If the tmux session exists (reattach case), just use the name.
