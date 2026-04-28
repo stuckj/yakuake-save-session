@@ -8,8 +8,19 @@ STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yakuake-session"
 STATE_FILE="$STATE_DIR/session.json"
 BACKUP_DIR="$STATE_DIR/backups"
 MAX_BACKUPS=10
+RESURRECT_SAVE="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
 
 mkdir -p "$STATE_DIR"
+
+# Save tmux state first (while everything is alive). This is critical at
+# shutdown — if Yakuake dies before we get here, we still want tmux state.
+# Run it in a background subshell with a timeout so a hung tmux can't block
+# the Yakuake save.
+if [[ -x "$RESURRECT_SAVE" ]] && tmux list-sessions &>/dev/null; then
+    timeout 10 tmux run-shell "$RESURRECT_SAVE" 2>/dev/null \
+        && echo "Saved tmux-resurrect state" \
+        || echo "Warning: tmux-resurrect save failed or timed out" >&2
+fi
 
 # Check that Yakuake process is actually running before querying D-Bus.
 # (D-Bus auto-activation would restart Yakuake if we queried it while dead.)
