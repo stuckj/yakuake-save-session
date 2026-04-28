@@ -7,15 +7,103 @@ set -euo pipefail
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yakuake-session"
 STATE_FILE="$STATE_DIR/session.json"
 BACKUP_DIR="$STATE_DIR/backups"
+FLAG_FILE="$STATE_DIR/restore-in-progress"
 MAX_BACKUPS=10
 RESURRECT_SAVE="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
 
 mkdir -p "$STATE_DIR"
 
-# Save tmux state first (while everything is alive). This is critical at
+# Clean up orphan tmux sessions: yakuake-* sessions that aren't connected
+# to any Yakuake tab. These accumulate when tabs are closed (tmux sessions
+# outlive their clients by default).
+#
+# Identification: build the in-use set by matching each Konsole session's
+# processId (from D-Bus) against tmux client PIDs. PID match means that
+# Konsole tab is currently driving that tmux session.
+#
+# Safeguards:
+#   - Skip during restore (FLAG_FILE present)
+#   - Skip if Yakuake D-Bus is not responsive
+#   - Skip if Konsole has sessions but no tmux clients matched (matching broken)
+#   - If a candidate orphan has ANY client attached, log warning and skip
+#     (tmux new-session creates the session and attaches the client atomically,
+#     so during normal tab creation there's no real window without a client)
+cleanup_orphan_tmux_sessions() {
+    [[ -f "$FLAG_FILE" ]] && return 0
+    # Don't query D-Bus if Yakuake isn't running (auto-activation would start it)
+    pgrep -x yakuake &>/dev/null || return 0
+    qdbus org.kde.yakuake /yakuake/sessions sessionIdList &>/dev/null || return 0
+    tmux list-sessions &>/dev/null || return 0
+
+    local konsole_paths
+    konsole_paths=$(qdbus org.kde.yakuake 2>/dev/null | grep -E '^/Sessions/[0-9]+$' || true)
+    [[ -z "$konsole_paths" ]] && return 0
+
+    # Build pid -> session_name map from tmux clients
+    local clients_data
+    clients_data=$(tmux list-clients -F '#{client_pid} #{session_name}' 2>/dev/null || true)
+
+    declare -A in_use=()
+    declare -A pid_for_path=()
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        local pid
+        pid=$(qdbus org.kde.yakuake "$path" processId 2>/dev/null || echo "")
+        [[ -z "$pid" ]] && continue
+        pid_for_path["$path"]="$pid"
+        local session
+        session=$(echo "$clients_data" | awk -v p="$pid" '$1==p {print $2; exit}')
+        [[ -n "$session" ]] && in_use["$session"]=1
+    done <<< "$konsole_paths"
+
+    if [[ ${#in_use[@]} -eq 0 ]]; then
+        echo "Cleanup: Konsole has sessions but no tmux clients matched; skipping cleanup" >&2
+        return 0
+    fi
+
+    local killed=0
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        [[ "$name" != yakuake-* ]] && continue
+        [[ -n "${in_use[$name]:-}" ]] && continue
+
+        # Safeguard: any clients attached? log warning instead of killing
+        local clients_for_session
+        clients_for_session=$(tmux list-clients -t "$name" -F '#{client_pid} #{client_tty}' 2>/dev/null || true)
+        if [[ -n "$clients_for_session" ]]; then
+            {
+                echo "WARNING: tmux session '$name' has clients but didn't match any Yakuake tab"
+                echo "  Clients on '$name':"
+                echo "$clients_for_session" | sed 's/^/    /'
+                echo "  All Yakuake Konsole sessions and PIDs:"
+                for path in "${!pid_for_path[@]}"; do
+                    echo "    $path: pid=${pid_for_path[$path]}"
+                done
+                echo "  All tmux clients:"
+                echo "$clients_data" | sed 's/^/    /'
+                echo "  Matched in-use tmux sessions:"
+                for s in "${!in_use[@]}"; do
+                    echo "    $s"
+                done
+            } >&2
+            continue
+        fi
+
+        if tmux kill-session -t "$name" 2>/dev/null; then
+            killed=$((killed + 1))
+        fi
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    (( killed > 0 )) && echo "Cleaned up $killed orphan tmux session(s)"
+    return 0
+}
+
+cleanup_orphan_tmux_sessions
+
+# Save tmux state (while everything is alive). This is critical at
 # shutdown — if Yakuake dies before we get here, we still want tmux state.
-# Run it in a background subshell with a timeout so a hung tmux can't block
-# the Yakuake save.
+# Run it with a timeout so a hung tmux can't block the Yakuake save.
 if [[ -x "$RESURRECT_SAVE" ]] && tmux list-sessions &>/dev/null; then
     timeout 10 tmux run-shell "$RESURRECT_SAVE" 2>/dev/null \
         && echo "Saved tmux-resurrect state" \
