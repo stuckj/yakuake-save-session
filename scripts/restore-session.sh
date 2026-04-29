@@ -27,7 +27,8 @@ fi
 
 # Wait for Yakuake process and D-Bus to be available (up to 30 seconds)
 for i in $(seq 1 30); do
-    if pgrep -x yakuake &>/dev/null && qdbus org.kde.yakuake /yakuake/sessions sessionIdList &>/dev/null; then
+    # Match Ubuntu's "yakuake" or NixOS's truncated ".yakuake-wrappe"
+    if pgrep -x 'yakuake|\.yakuake-wrappe' &>/dev/null && qdbus org.kde.yakuake /yakuake/sessions sessionIdList &>/dev/null; then
         break
     fi
     if [[ $i -eq 30 ]]; then

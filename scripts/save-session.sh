@@ -31,7 +31,8 @@ mkdir -p "$STATE_DIR"
 cleanup_orphan_tmux_sessions() {
     [[ -f "$FLAG_FILE" ]] && return 0
     # Don't query D-Bus if Yakuake isn't running (auto-activation would start it)
-    pgrep -x yakuake &>/dev/null || return 0
+    # Match Ubuntu's "yakuake" or NixOS's truncated ".yakuake-wrappe"
+    pgrep -x 'yakuake|\.yakuake-wrappe' &>/dev/null || return 0
     qdbus org.kde.yakuake /yakuake/sessions sessionIdList &>/dev/null || return 0
     tmux list-sessions &>/dev/null || return 0
 
@@ -112,7 +113,7 @@ fi
 
 # Check that Yakuake process is actually running before querying D-Bus.
 # (D-Bus auto-activation would restart Yakuake if we queried it while dead.)
-if ! pgrep -x yakuake &>/dev/null; then
+if ! pgrep -x 'yakuake|\.yakuake-wrappe' &>/dev/null; then
     echo "Yakuake is not running, nothing to save." >&2
     exit 1
 fi

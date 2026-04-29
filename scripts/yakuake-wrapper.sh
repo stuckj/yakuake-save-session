@@ -18,7 +18,10 @@ FLAG_FILE="$STATE_DIR/restore-in-progress"
 INSTRUCTION_DIR="$STATE_DIR/tab-instructions"
 
 yakuake_process_running() {
-    pgrep -x yakuake &>/dev/null
+    # Match Ubuntu's "yakuake" or NixOS's truncated ".yakuake-wrappe"
+    # (Linux truncates /proc/PID/comm to 15 chars; NixOS wraps binaries
+    # as ".NAME-wrapped").
+    pgrep -x 'yakuake|\.yakuake-wrappe' &>/dev/null
 }
 
 yakuake_dbus_ready() {
