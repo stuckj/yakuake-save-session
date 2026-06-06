@@ -74,13 +74,13 @@ else
     tmux new-session -d -s _yakuake_bootstrap
 
     # Give TPM a moment to initialize
-    sleep 1
+    sleep 2
 
     # Explicitly run tmux-resurrect restore
     if [[ -x "$RESURRECT_RESTORE" ]]; then
         tmux run-shell "$RESURRECT_RESTORE" 2>&1 || echo "Warning: resurrect restore failed" >&2
-        # Give resurrect time to recreate sessions
-        sleep 2
+        # Give resurrect time to recreate sessions (large configs need more time)
+        sleep 5
     else
         echo "Warning: tmux-resurrect restore script not found at $RESURRECT_RESTORE" >&2
     fi
@@ -117,6 +117,22 @@ find_new_konsole_sid() {
 
 default_session=$(qdbus org.kde.yakuake /yakuake/sessions sessionIdList | cut -d, -f1)
 
+# Pre-write instruction files for predictable Konsole session numbers.
+# After a reboot, Yakuake starts fresh and Konsole session IDs begin at 1.
+# The default tab gets Konsole session 1, and each addSession gets the next
+# number (2, 3, 4, ...). Writing these BEFORE creating tabs eliminates the
+# race condition where the profile script times out before the instruction
+# file is written.
+#
+# We still detect the actual IDs after creating tabs and write corrections
+# if they differ from predictions. The profile script in tmux-auto-session.sh
+# will find the correct file regardless.
+pre_first_konsole_sid=1
+for ((i = 0; i < tab_count; i++)); do
+    pre_konsole_sid=$((pre_first_konsole_sid + i))
+    echo "yakuake-${i}" > "$INSTRUCTION_DIR/$pre_konsole_sid"
+done
+
 # Snapshot initial Konsole sessions — for the default tab (tab 0), the
 # only existing Konsole session belongs to it.
 initial_konsole_sids=$(list_konsole_sids)
@@ -137,22 +153,40 @@ for ((i = 0; i < tab_count; i++)); do
         konsole_sid=$(find_new_konsole_sid "$before_sids" || true)
         if [[ -z "$konsole_sid" ]]; then
             echo "Warning: could not detect Konsole session for tab $i (yakuake sid=$session_id)" >&2
-            # Fall back to the old +1 assumption
-            konsole_sid=$((session_id + 1))
+            # Fall back: assume sequential IDs after the first
+            konsole_sid=$((pre_first_konsole_sid + i))
         fi
     fi
 
     # Set tab title
     qdbus org.kde.yakuake /yakuake/tabs org.kde.yakuake.setTabTitle "$session_id" "$title" 2>/dev/null
 
-    # Write instruction file for tmux-auto-session.sh.
-    # If the tmux session exists (reattach case), just use the name.
-    # If it doesn't (reboot + resurrect restored it, or fresh), the profile
-    # script will create it with -A (attach-or-create) and cd to the right dir.
+    # Determine which tmux session this tab should attach to.
+    # Priority:
+    #   1. Canonical name yakuake-${i} — if it already exists (reattach or
+    #      resurrect restored it), use it directly.
+    #   2. Saved tmux_session (e.g., yakuake-16) — if it exists (resurrect
+    #      restored it with a different name), rename it to yakuake-${i} so
+    #      scrollback is preserved and the profile script can attach cleanly.
+    #   3. No session exists — create a new one with the saved cwd.
     tmux_name="yakuake-${i}"
+    saved_tmux_session=$(jq -r ".tabs[$i].tmux_session // empty" "$STATE_FILE" 2>/dev/null || true)
 
-    # If the tmux session doesn't already exist, create it with the right directory
-    if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+        : # Canonical session exists (reattach or resurrect), use as-is
+    elif [[ -n "$saved_tmux_session" ]] && tmux has-session -t "$saved_tmux_session" 2>/dev/null; then
+        # Resurrect restored the session under its old name (e.g., yakuake-16).
+        # Rename it to the canonical name so scrollback is preserved.
+        echo "Renaming tmux session $saved_tmux_session -> $tmux_name (scrollback preserved)"
+        tmux rename-session -t "$saved_tmux_session" "$tmux_name" 2>/dev/null || true
+    elif [[ -n "$saved_tmux_session" ]] && [[ "$saved_tmux_session" != "yakuake-${i}" ]]; then
+        # Saved session doesn't exist and canonical doesn't exist.
+        # This is the fresh-boot case: resurrect may have failed or not run.
+        # Create with the canonical name and saved cwd.
+        tmux new-session -d -s "$tmux_name" -c "$cwd" 2>/dev/null || true
+    else
+        # No saved session name (old-format session.json) or same as canonical.
+        # Create fresh.
         tmux new-session -d -s "$tmux_name" -c "$cwd" 2>/dev/null || true
     fi
 
@@ -165,6 +199,8 @@ qdbus org.kde.yakuake /yakuake/sessions raiseSession "$first_session"
 
 echo "Restored $tab_count tabs"
 
-# Wait for profile scripts to consume instruction files before cleanup
-sleep 3
+# Wait for profile scripts to consume instruction files, then clean up.
+# The 5-second wait gives even slow systems time to start Konsole sessions
+# and run the profile command. Any remaining instruction files are stale.
+sleep 5
 cleanup

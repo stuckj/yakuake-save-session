@@ -17,49 +17,98 @@ mkdir -p "$STATE_DIR"
 # to any Yakuake tab. These accumulate when tabs are closed (tmux sessions
 # outlive their clients by default).
 #
-# Identification: build the in-use set by matching each Konsole session's
-# processId (from D-Bus) against tmux client PIDs. PID match means that
-# Konsole tab is currently driving that tmux session.
+# Matching strategy (in order of preference):
+#   1. KONSOLE_DBUS_SESSION env var: each tmux client's process has this in
+#      /proc/<pid>/environ, mapping directly to a Konsole /Sessions/N path.
+#      This is the most reliable method when tmux runs inside Konsole.
+#   2. Process tree walk: the Konsole-reported PID is the shell, not the
+#      tmux client. Walk ancestors to find a tmux client PID.
+#   3. D-Bus processId: match the Konsole session's reported PID directly.
 #
 # Safeguards:
 #   - Skip during restore (FLAG_FILE present)
 #   - Skip if Yakuake D-Bus is not responsive
-#   - Skip if Konsole has sessions but no tmux clients matched (matching broken)
 #   - If a candidate orphan has ANY client attached, log warning and skip
 #     (tmux new-session creates the session and attaches the client atomically,
 #     so during normal tab creation there's no real window without a client)
 cleanup_orphan_tmux_sessions() {
     [[ -f "$FLAG_FILE" ]] && return 0
-    # Don't query D-Bus if Yakuake isn't running (auto-activation would start it)
-    # Match Ubuntu's "yakuake" or NixOS's truncated ".yakuake-wrappe"
     pgrep -x 'yakuake|\.yakuake-wrappe' &>/dev/null || return 0
     qdbus org.kde.yakuake /yakuake/sessions sessionIdList &>/dev/null || return 0
     tmux list-sessions &>/dev/null || return 0
 
+    # Build the set of Konsole /Sessions/N paths that exist in Yakuake
     local konsole_paths
     konsole_paths=$(qdbus org.kde.yakuake 2>/dev/null | grep -E '^/Sessions/[0-9]+$' || true)
     [[ -z "$konsole_paths" ]] && return 0
 
-    # Build pid -> session_name map from tmux clients
+    declare -A active_konsole_sids=()
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        local sid
+        sid=$(echo "$path" | grep -oE '[0-9]+$')
+        [[ -n "$sid" ]] && active_konsole_sids["$sid"]=1
+    done <<< "$konsole_paths"
+
+    # Strategy 1: Match tmux clients to Konsole sessions via KONSOLE_DBUS_SESSION
+    # Each tmux client's process has KONSOLE_DBUS_SESSION=/Sessions/N in its
+    # environment. This directly links the client to the Konsole session.
+    declare -A in_use=()
     local clients_data
     clients_data=$(tmux list-clients -F '#{client_pid} #{session_name}' 2>/dev/null || true)
 
-    declare -A in_use=()
-    declare -A pid_for_path=()
-    while IFS= read -r path; do
-        [[ -z "$path" ]] && continue
-        local pid
-        pid=$(qdbus org.kde.yakuake "$path" processId 2>/dev/null || echo "")
+    while IFS=' ' read -r pid session; do
         [[ -z "$pid" ]] && continue
-        pid_for_path["$path"]="$pid"
-        local session
-        session=$(echo "$clients_data" | awk -v p="$pid" '$1==p {print $2; exit}')
-        [[ -n "$session" ]] && in_use["$session"]=1
-    done <<< "$konsole_paths"
+        local konsole_session
+        konsole_session=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | grep '^KONSOLE_DBUS_SESSION=' | head -1 | cut -d= -f2 || true)
+        if [[ -n "$konsole_session" ]] && [[ "$konsole_session" =~ /Sessions/([0-9]+) ]]; then
+            local sid="${BASH_REMATCH[1]}"
+            if [[ -n "${active_konsole_sids[$sid]:-}" ]]; then
+                in_use["$session"]=1
+                continue
+            fi
+        fi
+    done <<< "$clients_data"
 
+    # Strategy 2: Walk process tree from Konsole PIDs to find tmux client ancestors
     if [[ ${#in_use[@]} -eq 0 ]]; then
-        echo "Cleanup: Konsole has sessions but no tmux clients matched; skipping cleanup" >&2
-        return 0
+        declare -A pid_for_path=()
+        while IFS= read -r path; do
+            [[ -z "$path" ]] && continue
+            local pid
+            pid=$(qdbus org.kde.yakuake "$path" processId 2>/dev/null || echo "")
+            [[ -z "$pid" ]] && continue
+            pid_for_path["$path"]="$pid"
+            local session
+            session=$(echo "$clients_data" | awk -v p="$pid" '$1==p {print $2; exit}')
+            [[ -n "$session" ]] && in_use["$session"]=1
+        done <<< "$konsole_paths"
+
+        if [[ ${#in_use[@]} -eq 0 ]]; then
+            while IFS= read -r path; do
+                [[ -z "$path" ]] && continue
+                local pid="${pid_for_path[$path]:-}"
+                [[ -z "$pid" ]] && continue
+                local ppid="$pid"
+                for _ in $(seq 1 5); do
+                    local ppid_val
+                    ppid_val=$(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' ')
+                    [[ -z "$ppid_val" ]] && break
+                    local match
+                    match=$(echo "$clients_data" | awk -v p="$ppid_val" '$1==p {print $2; exit}')
+                    if [[ -n "$match" ]]; then
+                        in_use["$match"]=1
+                        break
+                    fi
+                    ppid="$ppid_val"
+                done
+            done <<< "$konsole_paths"
+        fi
+
+        if [[ ${#in_use[@]} -eq 0 ]]; then
+            echo "Cleanup: Konsole has sessions but no tmux clients matched; skipping cleanup" >&2
+            return 0
+        fi
     fi
 
     local killed=0
@@ -69,25 +118,10 @@ cleanup_orphan_tmux_sessions() {
         [[ "$name" != yakuake-* ]] && continue
         [[ -n "${in_use[$name]:-}" ]] && continue
 
-        # Safeguard: any clients attached? log warning instead of killing
         local clients_for_session
         clients_for_session=$(tmux list-clients -t "$name" -F '#{client_pid} #{client_tty}' 2>/dev/null || true)
         if [[ -n "$clients_for_session" ]]; then
-            {
-                echo "WARNING: tmux session '$name' has clients but didn't match any Yakuake tab"
-                echo "  Clients on '$name':"
-                echo "$clients_for_session" | sed 's/^/    /'
-                echo "  All Yakuake Konsole sessions and PIDs:"
-                for path in "${!pid_for_path[@]}"; do
-                    echo "    $path: pid=${pid_for_path[$path]}"
-                done
-                echo "  All tmux clients:"
-                echo "$clients_data" | sed 's/^/    /'
-                echo "  Matched in-use tmux sessions:"
-                for s in "${!in_use[@]}"; do
-                    echo "    $s"
-                done
-            } >&2
+            echo "WARNING: tmux session '$name' has clients but didn't match any Yakuake tab; skipping" >&2
             continue
         fi
 
@@ -118,6 +152,20 @@ if ! pgrep -x 'yakuake|\.yakuake-wrappe' &>/dev/null; then
     exit 1
 fi
 
+# Build a map from Konsole session ID -> tmux session name by reading
+# KONSOLE_DBUS_SESSION from each tmux client's /proc/<pid>/environ.
+# This correctly handles cases where session names don't match tab indices
+# (e.g., after a failed restore that created yakuake-16..30 instead of 0..14).
+declare -A konsole_sid_to_tmux=()
+clients_data=$(tmux list-clients -F '#{client_pid} #{session_name}' 2>/dev/null || true)
+while IFS=' ' read -r pid session; do
+    [[ -z "$pid" ]] && continue
+    konsole_env=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | grep '^KONSOLE_DBUS_SESSION=' | head -1 || true)
+    if [[ -n "$konsole_env" ]] && [[ "$konsole_env" =~ /Sessions/([0-9]+) ]]; then
+        konsole_sid_to_tmux["${BASH_REMATCH[1]}"]="$session"
+    fi
+done <<< "$clients_data"
+
 # Get tabs in visual order using sessionAtTab (sessionIdList is creation order, not tab order)
 session_id_list=$(qdbus org.kde.yakuake /yakuake/sessions sessionIdList)
 tab_count=$(echo "$session_id_list" | tr ',' '\n' | wc -l)
@@ -137,20 +185,34 @@ for ((i=0; i<tab_count; i++)); do
     konsole_sid=$(echo "$terminal_ids" | cut -d, -f1)
     [[ -z "$konsole_sid" ]] && konsole_sid=$((sid + 1))
 
+    # Determine the actual tmux session name for this tab.
+    # Try: Konsole session -> tmux session map (handles misaligned names).
+    # Fallback: canonical name yakuake-$i.
+    actual_tmux_session="yakuake-${i}"
+    if [[ -n "${konsole_sid_to_tmux[$konsole_sid]:-}" ]]; then
+        actual_tmux_session="${konsole_sid_to_tmux[$konsole_sid]}"
+    fi
+
     # Get the working directory. If the terminal is running tmux, query tmux
     # for the pane's cwd (since /proc/<tmux-client-pid>/cwd is just where
     # tmux was launched from, not the shell's actual directory).
     cwd="$HOME"
 
-    # First try tmux: check if this tab has a tmux session named yakuake-$i
-    tmux_cwd=$(tmux display-message -t "yakuake-${i}" -p '#{pane_current_path}' 2>/dev/null || echo "")
+    tmux_cwd=$(tmux display-message -t "$actual_tmux_session" -p '#{pane_current_path}' 2>/dev/null || echo "")
     if [[ -n "$tmux_cwd" ]]; then
         cwd="$tmux_cwd"
     else
+        # Try canonical name as fallback (may exist even if map didn't find it)
+        if [[ "$actual_tmux_session" != "yakuake-${i}" ]]; then
+            tmux_cwd=$(tmux display-message -t "yakuake-${i}" -p '#{pane_current_path}' 2>/dev/null || echo "")
+            [[ -n "$tmux_cwd" ]] && cwd="$tmux_cwd"
+        fi
         # Fallback: read from /proc for non-tmux terminals
-        pid=$(qdbus org.kde.yakuake /Sessions/$konsole_sid processId 2>/dev/null || echo "")
-        if [[ -n "$pid" ]] && [[ -d "/proc/$pid/cwd" ]]; then
-            cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "$HOME")
+        if [[ "$cwd" == "$HOME" ]]; then
+            pid=$(qdbus org.kde.yakuake /Sessions/$konsole_sid processId 2>/dev/null || echo "")
+            if [[ -n "$pid" ]] && [[ -d "/proc/$pid/cwd" ]]; then
+                cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "$HOME")
+            fi
         fi
     fi
 
@@ -160,12 +222,14 @@ for ((i=0; i<tab_count; i++)); do
         --arg cwd "$cwd" \
         --arg sid "$sid" \
         --arg tids "$terminal_ids" \
+        --arg tmux_session "$actual_tmux_session" \
         '. + [{
             "index": $idx,
             "session_id": ($sid | tonumber),
             "title": $title,
             "cwd": $cwd,
-            "terminal_ids": $tids
+            "terminal_ids": $tids,
+            "tmux_session": $tmux_session
         }]')
 
     index=$((index + 1))

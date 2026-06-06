@@ -46,6 +46,30 @@ start_yakuake() {
     return 1
 }
 
+wait_for_display() {
+    # On Wayland environments (NixOS, etc.), the display may not be ready
+    # when the autostart entry fires. Starting Yakuake before the display
+    # is ready causes it to crash with "Could not load the Qt platform
+    # plugin". Wait for the display to become available.
+    for i in $(seq 1 30); do
+        if [[ -n "${WAYLAND_DISPLAY:-}" ]] || [[ -n "${DISPLAY:-}" ]]; then
+            # Wayland: check that the compositor socket exists
+            if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+                local wayland_socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY}"
+                if [[ -S "$wayland_socket" ]] || [[ -n "${DISPLAY:-}" ]]; then
+                    echo "Display is ready ($WAYLAND_DISPLAY)"
+                    return 0
+                fi
+            elif [[ -n "${DISPLAY:-}" ]]; then
+                echo "Display is ready ($DISPLAY)"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "Warning: display not detected after 30s, proceeding anyway" >&2
+}
+
 restore_session() {
     echo "Restoring Yakuake session..."
     "$RESTORE_SCRIPT" || echo "Warning: failed to restore session" >&2
@@ -63,6 +87,11 @@ fi
 # Clean stale state from a previous restore that may have crashed
 rm -f "$FLAG_FILE"
 rm -rf "$INSTRUCTION_DIR"
+
+# Wait for the display to be ready before starting Yakuake. Without this,
+# Yakuake crashes repeatedly on Wayland systems where the compositor starts
+# after autostart entries are processed.
+wait_for_display
 
 # Create the restore-in-progress flag BEFORE starting Yakuake.
 # This tells the Konsole profile script (tmux-auto-session.sh) to wait
