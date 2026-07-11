@@ -14,6 +14,23 @@ INSTRUCTION_DIR="$STATE_DIR/tab-instructions"
 FLAG_FILE="$STATE_DIR/restore-in-progress"
 RESURRECT_RESTORE="$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
 
+# qdbus (Qt 6.11 / qttools) segfaults in its atexit handler AFTER it has
+# already produced correct output (QMetaType::unregisterMetaType, reached via
+# registerComplexDBusType's hash destructor during exit()). The D-Bus call
+# itself succeeds; only the teardown crashes, so the process exits via SIGSEGV
+# (status >= 128) and dumps core. Wrap it to (a) disable the core dump and
+# (b) treat a signal-kill as success so `set -e` doesn't abort restore on a
+# crash that happened after the work was done.
+_QDBUS_BIN="$(type -P qdbus || true)"
+qdbus() {
+    local out rc
+    out="$(ulimit -c 0; "$_QDBUS_BIN" "$@" 2>/dev/null)"
+    rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    (( rc >= 128 )) && return 0
+    return "$rc"
+}
+
 cleanup() {
     rm -f "$FLAG_FILE"
     rm -rf "$INSTRUCTION_DIR"
@@ -39,15 +56,8 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-tab_count=$(jq '.tabs | length' "$STATE_FILE")
-
-if [[ "$tab_count" -eq 0 ]]; then
-    echo "No tabs to restore" >&2
-    cleanup
-    exit 0
-fi
-
-echo "Restoring $tab_count tabs..."
+saved_tab_count=$(jq '.tabs | length' "$STATE_FILE")
+echo "Restoring session ($saved_tab_count saved tab(s))..."
 
 # --- Restore tmux sessions if needed ---
 if tmux list-sessions &>/dev/null 2>&1; then
@@ -88,6 +98,47 @@ else
     # Clean up bootstrap session
     tmux kill-session -t _yakuake_bootstrap 2>/dev/null || true
 fi
+
+# --- Build the ordered list of tabs to create ---
+# Union of saved tabs and every tmux session that resurrect actually restored,
+# so no restored scrollback buffer is ever left without a tab (an untabbed
+# session would eventually be reaped as an orphan, losing its scrollback).
+# Saved tabs come first, preserving their title/order; any restored session not
+# referenced by a saved tab is appended with a generic title.
+declare -a entry_title=() entry_cwd=() entry_tmux=()
+declare -A saved_sessions=()
+
+while IFS=$'\t' read -r e_tmux e_title e_cwd; do
+    # A saved tab with no tmux session (rare raw-shell tab) gets a fresh name
+    # so the profile script creates a new session for it rather than colliding.
+    [[ -z "$e_tmux" ]] && e_tmux="yakuake-fresh-${RANDOM}"
+    entry_tmux+=("$e_tmux")
+    entry_title+=("$e_title")
+    entry_cwd+=("$e_cwd")
+    saved_sessions["$e_tmux"]=1
+done < <(jq -r '.tabs[] | [.tmux_session // "", .title // "", .cwd // ""] | @tsv' "$STATE_FILE")
+
+# Append restored tmux sessions that no saved tab references.
+while IFS= read -r s; do
+    [[ -z "$s" ]] && continue
+    [[ "$s" != yakuake-* ]] && continue
+    [[ -n "${saved_sessions[$s]:-}" ]] && continue
+    echo "Restored session '$s' had no saved tab; adding one to preserve its scrollback" >&2
+    entry_tmux+=("$s")
+    entry_title+=("$s")
+    s_cwd=$(tmux display-message -t "$s" -p '#{pane_current_path}' 2>/dev/null || echo "$HOME")
+    entry_cwd+=("$s_cwd")
+done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+tab_count=${#entry_tmux[@]}
+
+if [[ "$tab_count" -eq 0 ]]; then
+    echo "No tabs or sessions to restore" >&2
+    cleanup
+    exit 0
+fi
+
+echo "Creating $tab_count tab(s)..."
 
 # --- Create tabs and write instruction files ---
 mkdir -p "$INSTRUCTION_DIR"
@@ -130,7 +181,7 @@ default_session=$(qdbus org.kde.yakuake /yakuake/sessions sessionIdList | cut -d
 pre_first_konsole_sid=1
 for ((i = 0; i < tab_count; i++)); do
     pre_konsole_sid=$((pre_first_konsole_sid + i))
-    echo "yakuake-${i}" > "$INSTRUCTION_DIR/$pre_konsole_sid"
+    echo "${entry_tmux[$i]}" > "$INSTRUCTION_DIR/$pre_konsole_sid"
 done
 
 # Snapshot initial Konsole sessions — for the default tab (tab 0), the
@@ -139,8 +190,9 @@ initial_konsole_sids=$(list_konsole_sids)
 default_konsole_sid=$(echo "$initial_konsole_sids" | head -1)
 
 for ((i = 0; i < tab_count; i++)); do
-    title=$(jq -r ".tabs[$i].title" "$STATE_FILE")
-    cwd=$(jq -r ".tabs[$i].cwd" "$STATE_FILE")
+    title="${entry_title[$i]}"
+    cwd="${entry_cwd[$i]}"
+    tmux_name="${entry_tmux[$i]}"
 
     # First tab: reuse the existing default session. Otherwise: add a new one
     # and detect which Konsole session path was created for it.
@@ -161,32 +213,14 @@ for ((i = 0; i < tab_count; i++)); do
     # Set tab title
     qdbus org.kde.yakuake /yakuake/tabs org.kde.yakuake.setTabTitle "$session_id" "$title" 2>/dev/null
 
-    # Determine which tmux session this tab should attach to.
-    # Priority:
-    #   1. Canonical name yakuake-${i} — if it already exists (reattach or
-    #      resurrect restored it), use it directly.
-    #   2. Saved tmux_session (e.g., yakuake-16) — if it exists (resurrect
-    #      restored it with a different name), rename it to yakuake-${i} so
-    #      scrollback is preserved and the profile script can attach cleanly.
-    #   3. No session exists — create a new one with the saved cwd.
-    tmux_name="yakuake-${i}"
-    saved_tmux_session=$(jq -r ".tabs[$i].tmux_session // empty" "$STATE_FILE" 2>/dev/null || true)
-
-    if tmux has-session -t "$tmux_name" 2>/dev/null; then
-        : # Canonical session exists (reattach or resurrect), use as-is
-    elif [[ -n "$saved_tmux_session" ]] && tmux has-session -t "$saved_tmux_session" 2>/dev/null; then
-        # Resurrect restored the session under its old name (e.g., yakuake-16).
-        # Rename it to the canonical name so scrollback is preserved.
-        echo "Renaming tmux session $saved_tmux_session -> $tmux_name (scrollback preserved)"
-        tmux rename-session -t "$saved_tmux_session" "$tmux_name" 2>/dev/null || true
-    elif [[ -n "$saved_tmux_session" ]] && [[ "$saved_tmux_session" != "yakuake-${i}" ]]; then
-        # Saved session doesn't exist and canonical doesn't exist.
-        # This is the fresh-boot case: resurrect may have failed or not run.
-        # Create with the canonical name and saved cwd.
-        tmux new-session -d -s "$tmux_name" -c "$cwd" 2>/dev/null || true
-    else
-        # No saved session name (old-format session.json) or same as canonical.
-        # Create fresh.
+    # Attach this tab to its saved tmux session by NAME. resurrect restores
+    # sessions under their original names, so scrollback is preserved and the
+    # title (set above) travels with the correct content. If the named session
+    # is missing (e.g. the resurrect save was interrupted), create it with the
+    # saved cwd so the tab is never blank. When it exists the profile script
+    # attaches to it via `tmux new-session -A`.
+    if ! tmux has-session -t "$tmux_name" 2>/dev/null; then
+        echo "Warning: saved session '$tmux_name' not restored; creating it fresh at $cwd" >&2
         tmux new-session -d -s "$tmux_name" -c "$cwd" 2>/dev/null || true
     fi
 
