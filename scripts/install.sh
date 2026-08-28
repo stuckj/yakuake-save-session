@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install yakuake-save-session: symlinks scripts to ~/.local/bin, generates
-# systemd units and autostart entry, installs tmux plugins.
+# systemd units and the autostart entry.
 #
 # Safe to run multiple times (idempotent).
 
@@ -10,7 +10,6 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="$HOME/.local/bin"
 AUTOSTART_DIR="$HOME/.config/autostart"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-TPM_DIR="$HOME/.tmux/plugins/tpm"
 
 echo "=== yakuake-save-session installer ==="
 echo "Project dir: $PROJECT_DIR"
@@ -23,7 +22,7 @@ mkdir -p "$BIN_DIR"
 ln -sf "$PROJECT_DIR/scripts/save-session.sh" "$BIN_DIR/yakuake-session-save"
 ln -sf "$PROJECT_DIR/scripts/restore-session.sh" "$BIN_DIR/yakuake-session-restore"
 ln -sf "$PROJECT_DIR/scripts/yakuake-wrapper.sh" "$BIN_DIR/yakuake-session-wrapper"
-ln -sf "$PROJECT_DIR/scripts/tmux-auto-session.sh" "$BIN_DIR/yakuake-session-tmux"
+rm -f "$BIN_DIR/yakuake-session-tmux"  # left over from the tmux-integrated versions
 echo "[ok] Scripts symlinked to $BIN_DIR"
 
 # --- Back up and replace Yakuake autostart ---
@@ -89,7 +88,7 @@ WantedBy=timers.target
 EOF
 
 # Shutdown service: triggers ExecStop on logout, sleep, hibernate, shutdown,
-# or reboot — any event that would otherwise lose unsaved tmux/Yakuake state.
+# or reboot — any event that would otherwise lose unsaved Yakuake tab state.
 #
 # Design notes:
 #   - DefaultDependencies=no prevents systemd from auto-adding ordering
@@ -134,76 +133,21 @@ echo "[ok] Enabled systemd autosave timer"
 systemctl --user enable --now yakuake-session-shutdown.service
 echo "[ok] Enabled systemd shutdown save service"
 
-# --- Set up Konsole profile for Yakuake ---
-KONSOLE_PROFILE_DIR="$HOME/.local/share/konsole"
-KONSOLE_PROFILE="$KONSOLE_PROFILE_DIR/Yakuake Tmux.profile"
-mkdir -p "$KONSOLE_PROFILE_DIR"
-
-cat > "$KONSOLE_PROFILE" <<EOF
-[General]
-Command=$BIN_DIR/yakuake-session-tmux
-Name=Yakuake Tmux
-Parent=FALLBACK/
-
-[Scrolling]
-HistoryMode=2
-EOF
-echo "[ok] Generated Konsole profile at $KONSOLE_PROFILE"
-
-# Point Yakuake at the new profile
+# --- Remove the tmux Konsole profile from earlier versions ---
+# Tabs are plain shells now. The old profile ran a per-tab tmux launcher that no
+# longer exists, so leaving it as DefaultProfile would break every new tab.
+KONSOLE_PROFILE="$HOME/.local/share/konsole/Yakuake Tmux.profile"
 YAKUAKERC="$HOME/.config/yakuakerc"
-if [[ -f "$YAKUAKERC" ]]; then
-    if grep -q '^DefaultProfile=' "$YAKUAKERC"; then
-        sed -i 's/^DefaultProfile=.*/DefaultProfile=Yakuake Tmux.profile/' "$YAKUAKERC"
-    else
-        sed -i '/^\[Desktop Entry\]/a DefaultProfile=Yakuake Tmux.profile' "$YAKUAKERC"
-    fi
-else
-    mkdir -p "$(dirname "$YAKUAKERC")"
-    cat > "$YAKUAKERC" <<EOF
-[Desktop Entry]
-DefaultProfile=Yakuake Tmux.profile
-EOF
-fi
-echo "[ok] Yakuake configured to use Yakuake Tmux profile"
 
-# --- Install tmux plugin manager (if not present) ---
-if [[ ! -d "$TPM_DIR" ]]; then
-    echo "Installing tmux plugin manager (TPM)..."
-    git clone https://github.com/tmux-plugins/tpm "$TPM_DIR"
-    echo "[ok] TPM installed"
-else
-    echo "[ok] TPM already installed"
+if [[ -f "$KONSOLE_PROFILE" ]]; then
+    rm -f "$KONSOLE_PROFILE"
+    echo "[ok] Removed obsolete Konsole profile"
 fi
 
-# --- Set up tmux config ---
-TMUX_CONF="$HOME/.tmux.conf"
-SOURCE_LINE="source-file $PROJECT_DIR/tmux.conf"
-
-if [[ -f "$TMUX_CONF" ]]; then
-    if ! grep -qF "$SOURCE_LINE" "$TMUX_CONF"; then
-        echo "" >> "$TMUX_CONF"
-        echo "# yakuake-save-session tmux config" >> "$TMUX_CONF"
-        echo "$SOURCE_LINE" >> "$TMUX_CONF"
-        echo "[ok] Added source-file line to existing $TMUX_CONF"
-    else
-        echo "[ok] $TMUX_CONF already sources our config"
-    fi
-else
-    echo "$SOURCE_LINE" > "$TMUX_CONF"
-    echo "[ok] Created $TMUX_CONF"
+if [[ -f "$YAKUAKERC" ]] && grep -q '^DefaultProfile=Yakuake Tmux.profile' "$YAKUAKERC"; then
+    sed -i '/^DefaultProfile=Yakuake Tmux.profile$/d' "$YAKUAKERC"
+    echo "[ok] Reset Yakuake to its default profile"
 fi
-
-# --- Install tmux plugins directly (doesn't require a running tmux server) ---
-PLUGIN_DIR="$HOME/.tmux/plugins"
-for plugin in tmux-resurrect tmux-continuum; do
-    if [[ ! -d "$PLUGIN_DIR/$plugin" ]]; then
-        git clone "https://github.com/tmux-plugins/$plugin" "$PLUGIN_DIR/$plugin"
-        echo "[ok] Installed $plugin"
-    else
-        echo "[ok] $plugin already installed"
-    fi
-done
 
 # --- Initial save of current session ---
 echo ""
@@ -214,21 +158,18 @@ echo ""
 echo "=== Installation complete ==="
 echo ""
 echo "What happens now:"
-echo "  - Your current Yakuake tabs and tmux state have been saved"
-echo "  - Both are auto-saved every 5 minutes (systemd timer)"
-echo "  - Both are saved on logout/shutdown (systemd shutdown service,"
+echo "  - Your Yakuake tab names, order and working directories have been saved"
+echo "  - They are auto-saved every 5 minutes (systemd timer)"
+echo "  - They are saved on logout/shutdown (systemd shutdown service,"
 echo "    ordered to run while Yakuake is still alive)"
-echo "  - On next login, the wrapper script will start Yakuake and restore tabs"
-echo "  - Each tab attaches to a named tmux session for scrollback persistence"
-echo "  - tmux-continuum auto-save is disabled to avoid race conditions during shutdown"
+echo "  - On next login, the wrapper starts Yakuake and restores those tabs"
+echo "  - Tabs are plain shells. Run tmux in one yourself if you want it;"
+echo "    tmux persistence is continuum's job, not this project's."
 echo ""
 echo "To uninstall:"
 echo "  systemctl --user disable --now yakuake-session-autosave.timer"
 echo "  systemctl --user disable --now yakuake-session-shutdown.service"
-echo "  rm -f $BIN_DIR/yakuake-session-{save,restore,wrapper,tmux}"
+echo "  rm -f $BIN_DIR/yakuake-session-{save,restore,wrapper}"
 echo "  rm -f $NEW_AUTOSTART"
 echo "  rm -f $SYSTEMD_USER_DIR/yakuake-session-{autosave.service,autosave.timer,shutdown.service}"
-echo "  rm -f '$KONSOLE_PROFILE'"
 echo "  Restore $ORIGINAL_AUTOSTART from .bak"
-echo "  Set DefaultProfile back in $YAKUAKERC"
-echo "  Remove source-file line from $TMUX_CONF"

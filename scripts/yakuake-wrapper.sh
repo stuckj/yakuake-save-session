@@ -14,8 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 RESTORE_SCRIPT="$SCRIPT_DIR/restore-session.sh"
 
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yakuake-session"
-FLAG_FILE="$STATE_DIR/restore-in-progress"
-INSTRUCTION_DIR="$STATE_DIR/tab-instructions"
+
+# How long to wait for a usable display before giving up. Generous on purpose:
+# Plasma can take minutes to publish WAYLAND_DISPLAY after autostart fires, and
+# starting Yakuake without a display is not a degraded start — it is a hard Qt
+# abort ("could not load the Qt platform plugin") that repeats until something
+# gives up. Waiting costs nothing; not waiting costs the session.
+DISPLAY_WAIT_SECONDS=300
 
 # qdbus (Qt 6.11 / qttools) segfaults in its atexit handler AFTER it has
 # already produced correct output (QMetaType::unregisterMetaType, reached via
@@ -77,7 +82,7 @@ wait_for_display() {
     # fall back to probing for the Wayland socket directly), then EXPORT them so
     # the Yakuake we launch inherits a working display.
     local rundir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    for i in $(seq 1 30); do
+    for i in $(seq 1 "$DISPLAY_WAIT_SECONDS"); do
         # Import display vars from the systemd user manager if we don't have them.
         if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
             local line var val
@@ -114,7 +119,8 @@ wait_for_display() {
         fi
         sleep 1
     done
-    echo "Warning: display not detected after 30s, proceeding anyway" >&2
+    echo "No display after ${DISPLAY_WAIT_SECONDS}s; not starting Yakuake." >&2
+    return 1
 }
 
 restore_session() {
@@ -131,21 +137,16 @@ if yakuake_process_running; then
     exit 0
 fi
 
-# Clean stale state from a previous restore that may have crashed
-rm -f "$FLAG_FILE"
-rm -rf "$INSTRUCTION_DIR"
-
-# Wait for the display to be ready before starting Yakuake. Without this,
-# Yakuake crashes repeatedly on Wayland systems where the compositor starts
-# after autostart entries are processed.
-wait_for_display
-
-# Create the restore-in-progress flag BEFORE starting Yakuake.
-# This tells the Konsole profile script (tmux-auto-session.sh) to wait
-# for instruction files instead of auto-generating a tmux session name.
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
-touch "$FLAG_FILE"
+
+# Wait for the display before starting Yakuake. On Wayland the compositor is
+# routinely not up when autostart entries fire, and launching without one is a
+# crash loop rather than a slow start — so a failure here is a reason to stop,
+# not to continue.
+if ! wait_for_display; then
+    exit 1
+fi
 
 start_yakuake
 
