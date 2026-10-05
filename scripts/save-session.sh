@@ -47,17 +47,45 @@ if [[ "$tab_count" -le 0 ]]; then
     exit 0
 fi
 
+# Yakuake terminal IDs and Konsole's /Sessions/N paths are independent counters
+# that differ by a constant — on a fresh Yakuake it is 1 (terminal 3 is
+# /Sessions/4), but it is NOT guaranteed, so discover it rather than assume.
+# A candidate offset is only accepted if EVERY tab's terminal maps to a Konsole
+# session that actually exists, which makes a wrong guess fail loudly here
+# instead of silently attributing each tab the previous tab's directory.
+declare -a tab_sid=() tab_title=() tab_tid=()
+for ((i=0; i<tab_count; i++)); do
+    sid=$(qdbus org.kde.yakuake /yakuake/tabs sessionAtTab "$i")
+    tab_sid[i]="$sid"
+    tab_title[i]=$(qdbus org.kde.yakuake /yakuake/tabs tabTitle "$sid" 2>/dev/null || echo "")
+    tid=$(qdbus org.kde.yakuake /yakuake/sessions terminalIdsForSessionId "$sid" 2>/dev/null | cut -d, -f1)
+    tab_tid[i]="${tid:-$sid}"
+done
+
+konsole_sids=$(qdbus org.kde.yakuake 2>/dev/null | grep -oE '^/Sessions/[0-9]+$' | grep -oE '[0-9]+$' | sort -n)
+declare -A konsole_exists=()
+while IFS= read -r n; do
+    [[ -n "$n" ]] && konsole_exists["$n"]=1
+done <<< "$konsole_sids"
+
+offset=""
+for k in 1 0 $(seq 2 20); do
+    ok=1
+    for ((i=0; i<tab_count; i++)); do
+        [[ -n "${konsole_exists[$(( ${tab_tid[i]} + k ))]:-}" ]] || { ok=0; break; }
+    done
+    if (( ok )); then offset="$k"; break; fi
+done
+
+if [[ -z "$offset" ]]; then
+    echo "Warning: could not map tabs to Konsole sessions; keeping previous session.json" >&2
+    exit 0
+fi
+
 tabs_json="[]"
 
 for ((i=0; i<tab_count; i++)); do
-    sid=$(qdbus org.kde.yakuake /yakuake/tabs sessionAtTab "$i")
-    title=$(qdbus org.kde.yakuake /yakuake/tabs tabTitle "$sid" 2>/dev/null || echo "")
-
-    # Terminal IDs are a separate counter from session IDs (split panes consume
-    # them), so the /Sessions/N path is NOT sid+1. Ask for it.
-    terminal_ids=$(qdbus org.kde.yakuake /yakuake/sessions terminalIdsForSessionId "$sid" 2>/dev/null || echo "")
-    konsole_sid=$(echo "$terminal_ids" | cut -d, -f1)
-    [[ -z "$konsole_sid" ]] && konsole_sid=$((sid + 1))
+    konsole_sid=$(( ${tab_tid[i]} + offset ))
 
     # Working directory of the tab's shell. Konsole exposes processId but not
     # currentWorkingDirectory on these embedded sessions, so read it from /proc.
@@ -69,7 +97,7 @@ for ((i=0; i<tab_count; i++)); do
 
     tabs_json=$(echo "$tabs_json" | jq \
         --argjson idx "$i" \
-        --arg title "$title" \
+        --arg title "${tab_title[i]}" \
         --arg cwd "$cwd" \
         '. + [{
             "index": $idx,
